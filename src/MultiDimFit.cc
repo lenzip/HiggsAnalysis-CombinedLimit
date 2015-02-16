@@ -3,17 +3,22 @@
 #include <cmath>
 
 #include "TMath.h"
+#include "TH1.h"
 #include "RooArgSet.h"
 #include "RooArgList.h"
 #include "RooRandom.h"
 #include "RooAbsData.h"
+#include "RooAddPdf.h"
 #include "RooFitResult.h"
+#include "RooSimultaneous.h"
+#include "RooProdPdf.h"
 #include "../interface/RooMinimizerOpt.h"
 #include <RooStats/ModelConfig.h>
 #include "../interface/Combine.h"
 #include "../interface/CascadeMinimizer.h"
 #include "../interface/CloseCoutSentry.h"
 #include "../interface/utils.h"
+#include "../interface/MaxLikelihoodFit.h"
 
 #include <Math/Minimizer.h>
 #include <Math/MinimizerOptions.h>
@@ -88,6 +93,9 @@ bool MultiDimFit::runSpecific(RooWorkspace *w, RooStats::ModelConfig *mc_s, RooS
     static int isInit = false;
     if (!isInit) { initOnce(w, mc_s); isInit = true; }
 
+    fitOut.reset(TFile::Open("./mlfit.root", "RECREATE"));
+    createFitResultTrees(*mc_s,withSystematics);
+
     // Get PDF
     RooAbsPdf &pdf = *mc_s->GetPdf();
 
@@ -115,7 +123,6 @@ bool MultiDimFit::runSpecific(RooWorkspace *w, RooStats::ModelConfig *mc_s, RooS
         if (algo_ != None) Combine::commitPoint(/*expected=*/false, /*quantile=*/1.); // otherwise we get it multiple times
     }
    
-
     std::auto_ptr<RooAbsReal> nll;
     if (algo_ != None && algo_ != Singles) {
         nll.reset(pdf.createNLL(data, constrainCmdArg, RooFit::Extended(pdf.canBeExtended())));
@@ -145,7 +152,35 @@ bool MultiDimFit::runSpecific(RooWorkspace *w, RooStats::ModelConfig *mc_s, RooS
         case Contour2D: doContour2D(*nll); break;
         case Stitch2D: doStitch2D(*nll); break;
     }
-    
+
+    fitStatus_ = res->status();
+    numbadnll_ = res->numInvalidNLL();
+
+    if (withSystematics)   {
+      setFitResultTrees(mc_s->GetNuisanceParameters(),nuisanceParameters_);
+      setFitResultTrees(mc_s->GetGlobalObservables(),globalObservables_);
+      setFitResultTrees(mc_s->GetParametersOfInterest(),mu_);
+    }
+                 
+
+    if (1) {
+          RooArgSet *norms = new RooArgSet();
+          norms->setName("norm_fit_s");
+          MaxLikelihoodFit::CovarianceReSampler sampler(res.get());
+          getNormalizations(mc_s->GetPdf(), *mc_s->GetObservables(), *norms, sampler, fitOut.get(), "_fit_s");
+          setNormsFitResultTrees(norms,processNormalizations_);
+          delete norms;
+    }
+   
+    if (t_fit_sb_) t_fit_sb_->Fill();
+    fitOut->WriteTObject(res.get(),"fit_s");
+
+    if (fitOut.get()) {
+      fitOut->cd();
+      t_fit_sb_->Write();
+      fitOut.release()->Close();
+    }
+
     return true;
 }
 
@@ -528,6 +563,45 @@ void MultiDimFit::doStitch2D(RooAbsReal &nll)
 //    verbose++; // restore verbosity
 }
 
+void MultiDimFit::getShapesAndNorms(RooAbsPdf *pdf, const RooArgSet &obs, std::map<std::string,MaxLikelihoodFit::ShapeAndNorm> &out, const std::string &channel) {
+    RooSimultaneous *sim = dynamic_cast<RooSimultaneous *>(pdf);
+    if (sim != 0) {
+        RooAbsCategoryLValue &cat = const_cast<RooAbsCategoryLValue &>(sim->indexCat());
+        for (int i = 0, n = cat.numBins((const char *)0); i < n; ++i) {
+            cat.setBin(i);
+            RooAbsPdf *pdfi = sim->getPdf(cat.getLabel());
+            if (pdfi) getShapesAndNorms(pdfi, obs, out, cat.getLabel());
+        }
+        return;
+    }
+    RooProdPdf *prod = dynamic_cast<RooProdPdf *>(pdf);
+    if (prod != 0) {
+        RooArgList list(prod->pdfList());
+        for (int i = 0, n = list.getSize(); i < n; ++i) {
+            RooAbsPdf *pdfi = (RooAbsPdf *) list.at(i);
+            if (pdfi->dependsOn(obs)) getShapesAndNorms(pdfi, obs, out, channel);
+        }
+        return;
+    }
+    RooAddPdf *add = dynamic_cast<RooAddPdf *>(pdf);
+    if (add != 0) {
+        RooArgList clist(add->coefList());
+        RooArgList plist(add->pdfList());
+        for (int i = 0, n = clist.getSize(); i < n; ++i) {
+            RooAbsReal *coeff = (RooAbsReal *) clist.at(i);
+            MaxLikelihoodFit::ShapeAndNorm &ns = out[coeff->GetName()];
+            ns.norm = coeff;
+            ns.pdf = (RooAbsPdf*) plist.at(i);
+            ns.channel = (coeff->getStringAttribute("combine.channel") ? coeff->getStringAttribute("combine.channel") : channel.c_str());
+            ns.process = (coeff->getStringAttribute("combine.process") ? coeff->getStringAttribute("combine.process") : ns.norm->GetName());
+            ns.signal  = (coeff->getStringAttribute("combine.process") ? coeff->getAttribute("combine.signal") : (strstr(ns.norm->GetName(),"shapeSig") != 0));
+            std::auto_ptr<RooArgSet> myobs(ns.pdf->getObservables(obs));
+            ns.obs.add(*myobs);
+        }
+        return;
+    }
+}
+
 
 void MultiDimFit::doBox(RooAbsReal &nll, double cl, const char *name, bool commitPoints)  {
     unsigned int n = poi_.size();
@@ -579,3 +653,217 @@ void MultiDimFit::doBox(RooAbsReal &nll, double cl, const char *name, bool commi
     }
     verbose++; // restore verbosity 
 }
+
+void MultiDimFit::getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, RooArgSet &out, MaxLikelihoodFit::NuisanceSampler & sampler, TDirectory *fOut, const std::string &postfix) {
+    // fill in a map
+    std::map<std::string,MaxLikelihoodFit::ShapeAndNorm> snm;
+    getShapesAndNorms(pdf,obs, snm, "");
+    typedef std::map<std::string,MaxLikelihoodFit::ShapeAndNorm>::const_iterator IT;
+    typedef std::map<std::string,TH1*>::const_iterator IH;
+    // create directory structure for shapes
+    TDirectory *shapeDir = fOut ? fOut->mkdir((std::string("shapes")+postfix).c_str()) : 0;
+    std::map<std::string,TDirectory*> shapesByChannel;
+    if (shapeDir) {
+        for (IT it = snm.begin(), ed = snm.end(); it != ed; ++it) {
+            TDirectory *& sub = shapesByChannel[it->second.channel];
+            if (sub == 0) sub = shapeDir->mkdir(it->second.channel.c_str());
+        }
+    }
+    // now let's start with the central values
+    std::vector<double> vals(snm.size(), 0.), sumx2(snm.size(), 0.);
+    std::vector<TH1*>   shapes(snm.size(), 0), shapes2(snm.size(), 0);
+    std::vector<int>    bins(snm.size(), 0), sig(snm.size(), 0);
+    std::map<std::string,TH1*> totByCh, totByCh2, sigByCh, sigByCh2, bkgByCh, bkgByCh2;
+    IT bg = snm.begin(), ed = snm.end(), pair; int i;
+    for (pair = bg, i = 0; pair != ed; ++pair, ++i) {
+        vals[i] = pair->second.norm->getVal();
+        //out.addOwned(*(new RooConstVar(pair->first.c_str(), "", pair->second.norm->getVal())));
+        if (fOut != 0 && pair->second.obs.getSize() == 1) {
+            RooRealVar *x = (RooRealVar*)pair->second.obs.at(0);
+            TH1* hist = pair->second.pdf->createHistogram("", *x);
+            hist->SetNameTitle(pair->second.process.c_str(), (pair->second.process+" in "+pair->second.channel).c_str());
+            hist->Scale(vals[i] / hist->Integral("width"));
+            hist->SetDirectory(shapesByChannel[pair->second.channel]);
+            shapes[i] = hist;
+            if (0) {
+                shapes2[i] = (TH1*) hist->Clone();
+                shapes2[i]->SetDirectory(0);
+                shapes2[i]->Reset();
+                bins[i] = hist->GetNbinsX();
+                TH1 *&htot = totByCh[pair->second.channel];
+                if (htot == 0) {
+                    htot = (TH1*) hist->Clone();
+                    htot->SetName("total");
+                    htot->SetTitle(Form("Total signal+background in %s", pair->second.channel.c_str()));
+                    htot->SetDirectory(shapesByChannel[pair->second.channel]);
+                    TH1 *htot2 = (TH1*) hist->Clone(); htot2->Reset();
+                    htot2->SetDirectory(0);
+                    totByCh2[pair->second.channel] = htot2;
+                } else {
+                    htot->Add(hist);
+                }
+                sig[i] = pair->second.signal;
+                TH1 *&hpart = (sig[i] ? sigByCh : bkgByCh)[pair->second.channel];
+                if (hpart == 0) {
+                    hpart = (TH1*) hist->Clone();
+                    hpart->SetName((sig[i] ? "total_signal" : "total_background"));
+                    hpart->SetTitle(Form((sig[i] ? "Total signal in %s" : "Total background in %s"),pair->second.channel.c_str()));
+                    hpart->SetDirectory(shapesByChannel[pair->second.channel]);
+                    TH1 *hpart2 = (TH1*) hist->Clone(); hpart2->Reset();
+                    hpart2->SetDirectory(0);
+                    (sig[i] ? sigByCh2 : bkgByCh2)[pair->second.channel] = hpart2;
+                } else {
+                    hpart->Add(hist);
+                }
+            }
+        }
+    }
+    for (pair = bg, i = 0; pair != ed; ++pair, ++i) {
+        RooRealVar *val = new RooRealVar((pair->second.channel+"/"+pair->second.process).c_str(), "", vals[i]);
+        val->setError(sumx2[i]);
+        out.addOwned(*val); 
+        if (shapes[i]) shapesByChannel[pair->second.channel]->WriteTObject(shapes[i]);
+    }
+    if (fOut) {
+        fOut->WriteTObject(&out, (std::string("norm")+postfix).c_str()); 
+        for (IH h = totByCh.begin(), eh = totByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
+        for (IH h = sigByCh.begin(), eh = sigByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
+        for (IH h = bkgByCh.begin(), eh = bkgByCh.end(); h != eh; ++h) { shapesByChannel[h->first]->WriteTObject(h->second); }
+    }
+}
+
+void MultiDimFit::setNormsFitResultTrees(const RooArgSet *args, double * vals){
+
+         TIterator* iter(args->createIterator());
+         int count=0;
+
+         for (TObject *a = iter->Next(); a != 0; a = iter->Next()) {
+                 RooRealVar *rcv = dynamic_cast<RooRealVar *>(a);
+                 //std::string name = rcv->GetName();
+                 vals[count]=rcv->getVal();
+                 count++;
+         }
+         delete iter;
+         return;
+}
+
+void MultiDimFit::createFitResultTrees(const RooStats::ModelConfig &mc, bool withSys){
+    // Initiate the arrays to store parameters
+
+         // create TTrees to store fit results:
+         t_fit_sb_ = new TTree("tree_fit_sb","tree_fit_sb");
+
+         t_fit_sb_->Branch("fit_status",&fitStatus_,"fit_status/Int_t");
+
+         t_fit_sb_->Branch("numbadnll",&numbadnll_,"numbadnll/Int_t");
+
+         //t_fit_sb_->Branch("nll_min",&nll_sb_,"nll_min/Double_t");
+
+         //t_fit_sb_->Branch("nll_nll0",&nll_nll0_,"nll_nll0/Double_t");
+
+         int count=0; 
+         // fill the maps for the nuisances, and global observables
+         RooArgSet *norms = new RooArgSet();
+         getNormalizationsSimple(mc.GetPdf(), *mc.GetObservables(), *norms);
+ 
+         processNormalizations_ = new double[norms->getSize()];
+         const RooArgSet * pois = mc.GetParametersOfInterest();
+         mu_ = new double[pois->getSize()];
+         TIterator* iter_pois(pois->createIterator());
+         for (TObject *a = iter_pois->Next(); a != 0; a = iter_pois->Next()) { 
+                 RooRealVar *rrv = dynamic_cast<RooRealVar *>(a);
+                 std::string name = rrv->GetName();
+                 mu_[count]=0;
+                 t_fit_sb_->Branch(name.c_str(),&(mu_[count]),Form("%s/Double_t",name.c_str()));
+                 count++;
+          }     
+
+         // If no systematic (-S 0), then don't make nuisance trees
+         if (withSys){
+          count = 0;
+          const RooArgSet *cons = mc.GetGlobalObservables();
+          const RooArgSet *nuis = mc.GetNuisanceParameters();
+          globalObservables_ = new double[cons->getSize()];
+          nuisanceParameters_= new double[nuis->getSize()];
+
+          TIterator* iter_c(cons->createIterator());
+          for (TObject *a = iter_c->Next(); a != 0; a = iter_c->Next()) { 
+                 RooRealVar *rrv = dynamic_cast<RooRealVar *>(a);        
+                 std::string name = rrv->GetName();
+                 globalObservables_[count]=0;
+                 t_fit_sb_->Branch(name.c_str(),&(globalObservables_[count]),Form("%s/Double_t",name.c_str()));
+                 count++;
+          }         
+          count = 0;
+          TIterator* iter_n(nuis->createIterator());
+          for (TObject *a = iter_n->Next(); a != 0; a = iter_n->Next()) { 
+                 RooRealVar *rrv = dynamic_cast<RooRealVar *>(a);        
+                 std::string name = rrv->GetName();
+                 nuisanceParameters_[count] = 0;
+                 t_fit_sb_->Branch(name.c_str(),&(nuisanceParameters_[count])),Form("%s/Double_t",name.c_str());
+                 count++;
+          }
+
+         }
+
+         count = 0;
+         TIterator* iter_no(norms->createIterator());
+         for (TObject *a = iter_no->Next(); a != 0; a = iter_no->Next()) { 
+                 RooRealVar *rcv = dynamic_cast<RooRealVar *>(a);        
+                 std::string name = rcv->GetName();
+                 processNormalizations_[count] = 0;
+                 t_fit_sb_->Branch(name.c_str(),&(processNormalizations_[count])),Form("%s/Double_t",name.c_str());
+                 count++;
+         }
+         delete norms;
+
+        std::cout << "Created Branches" <<std::endl;
+         return;
+}
+
+void MultiDimFit::setFitResultTrees(const RooArgSet *args, double * vals){
+
+         TIterator* iter(args->createIterator());
+         int count=0;
+
+         for (TObject *a = iter->Next(); a != 0; a = iter->Next()) {
+                 RooRealVar *rrv = dynamic_cast<RooRealVar *>(a);
+                 //std::string name = rrv->GetName();
+                 vals[count]=rrv->getVal();
+                 count++;
+         }
+         delete iter;
+         return;
+}
+
+void MultiDimFit::getNormalizationsSimple(RooAbsPdf *pdf, const RooArgSet &obs, RooArgSet &out) {
+    RooSimultaneous *sim = dynamic_cast<RooSimultaneous *>(pdf);
+    if (sim != 0) {
+        RooAbsCategoryLValue &cat = const_cast<RooAbsCategoryLValue &>(sim->indexCat());
+        for (int i = 0, n = cat.numBins((const char *)0); i < n; ++i) {
+            cat.setBin(i);
+            RooAbsPdf *pdfi = sim->getPdf(cat.getLabel());
+            if (pdfi) getNormalizationsSimple(pdfi, obs, out);
+        }
+        return;
+    }
+    RooProdPdf *prod = dynamic_cast<RooProdPdf *>(pdf);
+    if (prod != 0) {
+        RooArgList list(prod->pdfList());
+        for (int i = 0, n = list.getSize(); i < n; ++i) {
+            RooAbsPdf *pdfi = (RooAbsPdf *) list.at(i);
+            if (pdfi->dependsOn(obs)) getNormalizationsSimple(pdfi, obs, out);
+        }
+        return;
+    }
+    RooAddPdf *add = dynamic_cast<RooAddPdf *>(pdf);
+    if (add != 0) {
+        RooArgList list(add->coefList());
+        for (int i = 0, n = list.getSize(); i < n; ++i) {
+            RooAbsReal *coeff = (RooAbsReal *) list.at(i);
+            out.addOwned(*(new RooRealVar(coeff->GetName(), "", coeff->getVal())));
+        }
+        return;
+    }
+}
+

@@ -9,8 +9,10 @@
  *
  */
 #include "../interface/FitterAlgoBase.h"
+#include "../interface/MaxLikelihoodFit.h"
 #include <RooRealVar.h>
 #include <vector>
+#include "TFile.h"
 
 class MultiDimFit : public FitterAlgoBase {
 public:
@@ -24,6 +26,13 @@ public:
 protected:
   virtual bool runSpecific(RooWorkspace *w, RooStats::ModelConfig *mc_s, RooStats::ModelConfig *mc_b, RooAbsData &data, double &limit, double &limitErr, const double *hint);
 
+  void getNormalizations(RooAbsPdf *pdf, const RooArgSet &obs, RooArgSet &out, MaxLikelihoodFit::NuisanceSampler & sampler, TDirectory *fOut, const std::string &postfix);
+  void getShapesAndNorms(RooAbsPdf *pdf, const RooArgSet &obs, std::map<std::string,MaxLikelihoodFit::ShapeAndNorm> &out, const std::string &channel);
+  void setNormsFitResultTrees(const RooArgSet *args, double * vals);
+  void setFitResultTrees(const RooArgSet *args, double * vals);
+  void createFitResultTrees(const RooStats::ModelConfig &mc, bool withSys);
+  void getNormalizationsSimple(RooAbsPdf *pdf, const RooArgSet &obs, RooArgSet &out);
+
   enum Algo { None, Singles, Cross, Grid, RandomPoints, Contour2D, Stitch2D };
   static Algo algo_;
 
@@ -36,6 +45,15 @@ protected:
   static RooArgList                poiList_; 
   static unsigned int              nOtherFloatingPoi_; // keep a count of other POIs that we're ignoring, for proper chisquare normalization
   static float                     deltaNLL_;
+  std::auto_ptr<TFile> fitOut;
+  int fitStatus_, numbadnll_;
+  double nll_sb_;
+  double* mu_; 
+  double* globalObservables_;
+  double* nuisanceParameters_;
+  double* processNormalizations_;
+
+  TTree *t_fit_sb_;
 
   // options    
   static unsigned int points_, firstPoint_, lastPoint_;

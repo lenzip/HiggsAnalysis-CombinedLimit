@@ -61,6 +61,7 @@ protected:
   void setFitResultTrees(const RooArgSet *, double *);
   void setNormsFitResultTrees(const RooArgSet *, double *);
 
+public:
   struct ShapeAndNorm {
     bool        signal;
     std::string process;
@@ -70,7 +71,6 @@ protected:
     const RooAbsPdf  *pdf;
   };
   void getShapesAndNorms(RooAbsPdf *pdf, const RooArgSet &obs, std::map<std::string, ShapeAndNorm> &shapesAndNorms, const std::string &channel);
-
   class NuisanceSampler { 
     public:
         virtual ~NuisanceSampler() {}
