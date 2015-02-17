@@ -109,7 +109,9 @@ bool MultiDimFit::runSpecific(RooWorkspace *w, RooStats::ModelConfig *mc_s, RooS
         rrv->setConstant(!floatOtherPOIs_);
         if (floatOtherPOIs_) nOtherFloatingPoi_++;
     }
- 
+
+    std::auto_ptr<RooAbsPdf> nuisancePdf(utils::makeNuisancePdf(*mc_s));
+
     // start with a best fit
     const RooCmdArg &constrainCmdArg = withSystematics  ? RooFit::Constrain(*mc_s->GetNuisanceParameters()) : RooCmdArg();
     std::auto_ptr<RooFitResult> res;
